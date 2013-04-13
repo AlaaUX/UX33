@@ -1,1 +1,903 @@
-l
+#include <stdio.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <unistd.h>
+#include <sys/sem.h>
+#include <string.h>
+#include <pwd.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <fcntl.h>
+
+#define ROWS    6
+#define COLUMNS 7
+#define TOWIN   4
+#define YELLOW  "0;30;43m"
+#define BLUE    "0;37;44m"
+#define SHOWCURSOR printf("\033[?25h")
+#define HIDECURSOR printf("\033[?25l")
+#define SWITCH  (player==2)? (player = 1):(player = 2)
+#define MENUHELP printf("\033[24;3f\033[1;37;40m\033[2KUP/DOWN: move; ENTER: submit\033[m")
+
+int board[ROWS][COLUMNS];
+int player;
+int move;
+int win;
+int memid=-1, semid=-1, shmflg=0;
+int pid;
+int mins=10;
+int secs=0;
+int isTimer=0;
+
+char game[3][3] = {'0'};
+int xPos = 0, yPos = 0;
+int xTurn = 1;
+//int move;
+//int memid, semid;
+struct sembuf sopx, somx;
+char winner = '0';
+int filled = 0;
+int xo = 10, yo = 6;
+char* pointerx;
+
+
+
+void prtime();
+void gameTimer();
+void interrupted();
+void title();
+void display();
+int readMove();
+void animate(int idx);
+int play();
+int isValid(int x, int y);
+int draw();
+int checkIfMatches(int x, int y);
+int match(int x, int y, int stepX, int stepY);
+void printWinner(char* a, char* b);
+void connect4(char* argv);
+void startGame();
+void clearToMenu();
+void showMenu();
+void start();
+
+
+
+
+void printBorder(int x, int y){
+ int i;
+  printf("\033[34m");
+ for(i =0; i < 7; i++)
+ {
+  printf("\033[%d;%dH", (y + i), x);
+  if(i%2 == 0)
+   printf(" --- --- --- ");
+  else
+   printf("|   |   |   |");
+ }
+  printf("\033[30m");
+}
+
+void XOcheckWin()
+{
+ int i, j;
+ char curr ;
+ if(xTurn == 1) curr = 120; else curr = 111;
+ //check coloumns    
+ for(i = 0; i < 3;i++)
+ {
+  if( game[i][0] == curr && game[i][1] == curr && game[i][2] ==curr) 
+  {
+   winner = curr;
+   break;
+  }
+ }
+ //check rows
+ for(i = 0; i < 3;i++)
+ {
+  if( game[0][i] == curr && game[1][i] == curr && game[2][i] ==curr)
+  {
+   winner = curr;
+   break;
+  }
+ }
+ //check diagonal 1
+ if( game[0][0] == curr && game[1][1] == curr && game[2][2] ==curr)
+ {
+  winner = curr;
+ }
+ //check diagonal 2 
+ if( game[0][2] == curr && game[1][1] == curr && game[2][0] ==curr)
+ {
+  winner = curr;
+ }
+
+}
+
+
+
+
+void XOreadMove()
+{
+ int submitted = 0;
+ char op;
+ SHOWCURSOR;
+
+ while(!submitted)
+ {
+  //system ("/bin/stty -echo");
+  /* use system call to make terminal send all keystrokes directly to stdin */
+  //system ("/bin/stty raw");
+  op = getchar();
+  if( op == 'Q')
+  {
+   printf("\033[22;1f Are You sure, You want to quit ? Y/N: ");
+   op = 'Y';
+   if(op == 'Y' || op == 'y')
+   {
+    move = 'Q';
+    sprintf(pointerx, "%d", move); //print my move to shm
+    semop(semid,&sopx,1); //Allow other to start his turn
+    printf("\033[22;1f                                                    ");
+    printf("\033[22;1f Game is quited ");
+  	HIDECURSOR;
+    
+    semctl(semid, NULL, IPC_RMID, NULL);
+    shmctl(memid, IPC_RMID, NULL);
+    return;
+   }else {printf("\033[22;1f\033[2K");printf("\033[%d;%dH", yo + 2*yPos , xo + 4*xPos);continue;}
+   
+  }
+  else if( op == 120 ){//x pressed
+   if( game[xPos][yPos] == 111){} 
+   else if( game[xPos][yPos] == 120){} 
+   else if( xTurn == 0){}
+   else  
+   {
+    submitted = 1;
+   }
+  }else if( op == 111 ){//0 pressed
+   if( game[xPos][yPos] == 120){}
+   else if( game[xPos][yPos] == 111){}
+   else if(xTurn == 1){}
+   else
+   {
+    submitted = 1;
+   }
+ 
+  }
+  else if ( op == 27 )//Esc
+   {
+    op = getchar();
+    if( op == 91) //[
+    {
+      switch( (op=getchar()) )
+      {
+        case 66://right
+         if( yPos < 2 ) yPos++;
+         break;
+        case 65://left
+         if( yPos > 0 ) yPos--;
+         break;
+        case 68://up
+         if( xPos > 0 ) xPos--;
+         break;
+        case 67://down
+         if( xPos < 2 ) xPos++;
+         break;        
+      }
+    }
+   } 
+  else if( op == 106 && yPos < 2 ) yPos++; // l -- go right
+  else if( op == 108 && xPos < 2 ) xPos++; // j -- go down
+  else if( op == 107 && yPos > 0 ) yPos--; // h -- go left
+  else if( op == 104 && xPos > 0 ) xPos--; // k -- go up
+  printf("\033[%d;%dH", yo + 2*yPos , xo + 4*xPos);
+ }
+ HIDECURSOR;
+ /* use system call to set terminal behaviour to more normal behaviour 
+  system ("/bin/stty cooked");
+  system ("/bin/stty echo");*/
+}
+
+void XOplay()
+{
+ printf("\033[%d;%dH", yo + 2*yPos , xo + 4*xPos);
+ if( xTurn == 1)
+ {	
+   printf("\033[31m");
+  printf("%c", 120);
+   printf("\033[30m");
+  game[xPos][yPos] = 120;
+  filled++;
+ }
+ else
+ {
+   printf("\033[32m");
+  printf("%c", 111);
+   printf("\033[30m");
+  game[xPos][yPos] = 111;
+  filled++;
+ }
+}
+
+
+int XO(char *argv)
+{
+ struct passwd *ppd;
+ struct shmid_ds buf;
+ int flg=1, key, i, j; //num of loops, xTurn num
+ int joined = 0;
+ char xName[10], oName[10];
+ char msg[1024];
+ mins = 10; secs = 0;
+
+ ppd = getpwnam(argv);
+ if(!ppd) { printf("User not found!\n"); }
+ else{
+	clearToMenu();
+	
+		isTimer=1;
+		gameTimer(); 
+		isTimer=0;
+ sopx.sem_num = 0; sopx.sem_op = 1; sopx.sem_flg = 0; //+1 operation
+        
+ somx.sem_num = 0; somx.sem_op = -1; somx.sem_flg = 0; //-1 operation
+
+ key = getuid() + ppd->pw_uid + 1;
+    
+ memid = shmget(key, NULL,NULL); 
+ printf("\033[24;3f\033[1;37;40m\033[2KRIGHT/LEFT: move; ENTER: submit; Q: back to menu\033[m");
+	fflush(stdout);
+ if(memid >= 0) //if shm already created
+ {
+  semid = semget(key, NULL, NULL);
+  semop(semid,&sopx,1); //semop to allow other xTurn to start playing
+
+  xTurn = 0;
+  flg = 1;
+  strcpy(xName, ppd->pw_name);
+  ppd = getpwuid(getuid());
+  strcpy(oName, ppd->pw_name);
+  sprintf(msg, "\033[2;1f\033[0;30;47m%s vs %s\033[m", xName, oName);
+ 
+  usleep(10000); //allow time for other xTurn to start
+ }
+ else //I need to create this game
+ {
+  memid = shmget(key, 32, IPC_CREAT | 0666);
+  semid = semget(key, 1, 0666|IPC_CREAT);
+  xTurn = 1;
+  strcpy(oName, ppd->pw_name);
+  ppd = getpwuid(getuid());
+  strcpy(xName, ppd->pw_name);
+  sprintf(msg, "\033[2;1f\033[0;30;47m%s vs %s\033[m", xName, oName);
+ }
+
+ pointerx = shmat(memid, 0,0); //get pointer to shm
+
+ printf("\033[8;15H");//clear");
+ fflush(stdout); //flush stdout to screen
+ //sleep(3);
+ //system("clear");
+ //system ("/bin/stty -echo"); //disable auto echo of pressed keys
+ 
+
+ //clear screen
+ //printf("\033[2J");
+ // go to the header of screen
+ //printf("\033[?6h");
+ printf("%s", msg);
+ printf("\033[23;1f\033[0;30;47m\033[2KWaiting For Other Player!\033[m");
+ //goto line 2, 6
+ printf("\033[5;10H");
+ printBorder(xo,yo);
+ xo+=2;
+ yo+=1;
+ printf("\033[%d;%dH", yo , xo);
+ 
+ do
+ {
+  printf("\033[%d;%dH", yo + 2*yPos , xo + 4*xPos);
+  fflush(stdout);
+  
+  while(semop(semid,&somx,1)) if(errno != EINTR) break; //wait until other xTurn finishes
+  printf("\033[23;1f\033[m\033[2K");
+  //system ("/bin/stty echo"); //enable auto echo of pressed keys
+  //printf("\033[2K");
+  //if(!joined)printf("\033[22;1fWaiting For other Player to join!");
+    
+  alarm(1);
+  if(xTurn==0 || xTurn==1 && filled < 9 && joined++){ // when to read move from other xTurn
+   move = atoi(pointerx); 
+   if ( move == 'Q')
+   {
+    printf("\033[22;1f\033[2K");
+    printf("\033[22;1f Game is quited by the other user");
+		 signal(SIGALRM, SIG_IGN);
+		isTimer=0;
+		
+    getchar();
+		isTimer=-1; gameTimer();    
+		semctl(semid, NULL, IPC_RMID, NULL);
+    shmctl(memid, IPC_RMID, NULL);
+  	return;
+   }
+   xPos = move % 10;
+   yPos = (move - xPos)/10;
+   if(xTurn==0) xTurn = 1; else xTurn = 0;
+   XOplay();
+   printf("\033[22;1f\033[2K");
+
+   
+   printf("\033[%d;%dH", yo + 2*yPos , xo + 4*xPos);
+   
+   XOcheckWin();
+   if(winner != 48 ){ 
+    break;
+   }
+   if(xTurn==0) xTurn = 1; else xTurn = 0;
+  } else {printf("\033[22;1f                                                                   ");printf("\033[%d;%dH", yo + 2*yPos , xo + 4*xPos);}
+  
+  
+  if(filled > 8){break;}
+	isTimer=2; signal(SIGALRM, gameTimer); 
+  XOreadMove();
+  XOplay();
+	isTimer=0; 
+  //system ("/bin/stty -echo"); //disable auto echo of pressed keys
+  move = xPos + yPos*10;
+  sprintf(pointerx, "%d", move); //print my move to shm
+  fflush(stdout);
+  printf("\033[%d;%dH", yo + 2*yPos , xo + 4*xPos);
+  
+  semop(semid,&sopx,1); //Allow other xTurn to start his turn
+
+  XOcheckWin();
+  if(winner != 48){
+   break;
+  }
+  if(filled < 9) printf("\033[23;1f\033[0;30;47m\033[2KWaiting For Other Player!");
+  if(filled > 8){break;}
+  usleep(10000); //time to allow other xTurn to start his turn
+ }while(filled < 9);
+ signal(SIGALRM, SIG_IGN);
+	
+ if(winner == 120) printf("\033[23;1f \033[31m %s (x) \033[30m won, \033[32m%s (o)\033[30m lose  .. press ENTER to Quit",xName, oName);
+ else if(winner == 111)printf("\033[23;1f \033[32m %s (o) \033[30m won, \033[31m%s (x)\033[30m lose  .. press ENTER to Quit",oName, xName);
+ else printf(" \033[23;1f Board filled and there is No Winner  .. press ENTER to Quit");
+ getchar();
+	isTimer=-1; gameTimer(); 
+ printf("\033[m");
+ if(flg)
+ {
+  semctl(semid, NULL, IPC_RMID, NULL);
+  shmctl(memid, IPC_RMID, NULL);
+ }
+	}
+}
+
+
+	char failez[10]; 
+int main(int argc, char **argv)
+{
+	int ffadd;
+	
+	sprintf(failez,"/tmp/%d.unique", getuid());
+	if((ffadd=open(failez, O_CREAT | O_EXCL , 0600) != -1))
+ 	 start();
+	else
+		printf("Cannot Duplicate process\n");
+	fflush(stdout);
+	close(ffadd);fflush(stdout);
+	//printf("OK%d\n", remove("/tmp/60004.unique")); perror("unlinked?");fflush(stdout);
+	return 77;
+}
+
+//#####################  Game Timer ##############################
+void gameTimer()
+{
+	if(isTimer>1) { signal(SIGALRM, gameTimer); alarm(1); }
+
+	if(isTimer)
+	{
+		system("tput sc");
+		fflush(stdout);
+		printf("\033[1;1f\033[1;37;40m");
+		fflush(stdout);
+	}
+	if(isTimer>0)
+	{
+		printf("%02d:%02d", mins, secs);fflush(stdout);
+		if(mins == 0 && secs==0);
+		else 	secs--;
+		if(secs<0){ secs=59; mins--; }
+	}
+	else if(isTimer<0)
+	{
+		printf("     ");
+	}
+	if(isTimer)
+	{
+		printf("\033[m");
+		fflush(stdout);
+		system("tput rc");
+		fflush(stdout);
+	}
+	
+}
+
+//#####################  Time Display ##############################
+void prtime() {
+	char rcv[4];
+  signal(SIGALRM, prtime);
+	system("tput sc");
+	fflush(stdout);
+  printf("\033[1;73f\033[1;37;40m");
+	fflush(stdout);
+  system("date +'%H:%M:%S'");
+	fflush(stdout);
+	/*printf("\033[1;1f%02d:%02d", mins, secs);
+	fflush(stdout);
+	if(mins == 0 && secs==0);
+	else 	secs--;
+	if(secs<0){ secs=59; mins--; }*/
+	printf("\033[m");
+	fflush(stdout);
+  system("tput rc");
+	fflush(stdout);
+  alarm (1); 
+}
+
+//####################### Interrupt Signal ########################
+void interrupted() {
+	printf("\033[m");
+	SHOWCURSOR;
+  system("/bin/stty echo");
+	system("tput rmcup");
+	if(shmflg){ 
+		semctl(semid, NULL, IPC_RMID, NULL);
+		shmctl(memid, IPC_RMID, NULL);
+	}
+	kill(pid, SIGKILL);
+  exit(1);
+}
+
+//####################### Title ########################
+void title()
+{
+	printf("\033[1;30f\033[1;37;40m\033[2KFrankfurt Game Server\n\033[0;30;47m\033[2K\033[m"); fflush(stdout);
+}
+
+//####################### Show Board ########################
+void display(){
+	int x=5, i, j; //start screen row, board row, board col
+	printf("\033[%d;15f",x);
+	printf(" 1  2  3  4  5  6  7 \n");
+	
+	for (i = 0; i < ROWS ; i++){
+		printf("\033[%d;15f",++x);
+		for (j = 0; j < COLUMNS ; j++){
+			printf("[%d]",board[i][j]);
+		}
+	}
+}
+
+//####################### Read User Move ########################
+int readMove(){
+	int flag=1, x=1, ch; //flag to break loop, pos of cursor, input char
+	printf("\033[11;16f");
+	SHOWCURSOR;
+	//while ((ch = read(0,NULL,1))); //Ignore entered characters previously to stdin
+	do{
+		ch=getchar();
+		switch(ch)
+		{
+			case 27: //ESC char
+				if((ch=getchar())==91) //After ESC [
+				{	
+					switch((ch=getchar()))
+					{
+						case 67: if(x<COLUMNS){ x++; printf("\033[3C"); } //Right
+						break;
+						case 68: if(x>1){ x--; printf("\033[3D"); } //Left
+						break;
+					}
+				}
+			break;
+			case 13: //Enter=Submit on this position
+				move=x;
+				flag=0;
+			break;
+			case 'Q':
+				move=-1;
+				flag=0;
+		}
+	}while(flag);
+	HIDECURSOR;
+	return move;
+}
+
+//####################### Animate Piece ########################
+void animate(int idx)
+{
+	int i;
+	char color[10];
+
+	(player==1) ? (strcpy(color,YELLOW)): (strcpy(color,BLUE));
+	for(i = 0 ; i <= idx ; i++)
+	{
+		printf("\033[%s\033[%d;%df[%d]", color, 6+i, 15+3*(move-1), board[idx][move-1]);
+		
+		if(i<idx){
+			usleep(1000);
+			printf("\033[m");
+			printf("\033[%d;%df[%d]",6+i, 15+3*(move-1), 0);
+		}
+	}
+}
+
+//####################### Drop Piece ########################
+int play(){
+	int fullSpots = 0;
+	int i;
+	//Determine where the player's piece falls
+	//If something occupies the lowest point already, put it above
+	for (i = ROWS-1 ; i >= 0; i--){
+		if (board[i][move - 1] == 0){
+			board[i][move - 1] = player;				
+			animate(i); //animation for dropping the piece
+			checkIfMatches(i, move-1);
+			printf("\033[m");
+			break;
+		}
+		else{
+			fullSpots += 1;
+		}
+	}
+	
+	//If there are no more rows in a column, tell the player to try again
+	if (fullSpots == ROWS){
+		printf("\033[22;1fThere are no empty spots on #%d! Try again!",move);
+		return 0;
+	}
+	else
+		return 1;
+}
+	
+//####################### Check Valid Point ########################
+int isValid(int x, int y)
+{
+	return (x >= 0 && x < ROWS && y >= 0 && y < COLUMNS && board[x][y] != 0)? 1 : 0;  
+}
+	
+//####################### Check Match in Direction ########################
+int match(int x, int y, int stepX, int stepY) {
+	/* Get the value of the start position. */
+	int i;
+	const int startValue = board[x][y];
+	int x1 = x, x2 = x, y1 = y, y2 = y;
+
+	/* Confirm the values around it match. */
+	i=0;
+	while (isValid(x + i * stepX, y + i * stepY) && 
+				board[x + i * stepX][y + i * stepY] == startValue) 
+	{ x1 += stepX; y1 += stepY; i++; }
+
+	i=0;
+	while (isValid(x - i * stepX, y - i * stepY) &&
+				 board[x - i * stepX][y - i * stepY] == startValue) 
+	{ x2 -= stepX; y2 -= stepY; i++; }
+
+	if( x1 - x2 > TOWIN || y1 - y2 > TOWIN)
+		win = startValue;
+	else 
+		return 0;
+	//printf("\033[?6h%d %d %d %d %d %d", x, y, y1, y2, stepX, stepY); getchar();
+
+	return 1;
+}
+	
+//####################### Check Draw ########################
+int draw()
+{
+	int i;
+	
+	for (i = 0; i < COLUMNS; i++)
+			if ( board[0][i] == 0)
+				return 0;
+	
+	return 3;
+}
+
+//####################### Check for Win ########################
+int checkIfMatches(int x, int y) {		
+	return 
+		   match(x, y, 1,  0) || // Vertical
+		   match(x, y, 0,  1) || // Horizontal
+		   match(x, y, 1,  1) || // Diagonal
+		   match(x, y, 1,  -1); 
+}
+
+//####################### Declare Winner ########################
+void printWinner(char* a, char* b)
+{
+	if(win == 1 && player == 1) printf("\033[23;1fYou WON: ((%s)), LOSER: %s ", a, b);
+	else 	if(win == 2 && player == 1) printf("\033[23;1f((%s)) WON, You LOST: %s ", b, a);
+	else 	if(win == 1 && player == 2) printf("\033[23;1f((%s)) WON, You LOST: %s ", b, a);
+	else 	if(win == 2 && player == 2) printf("\033[23;1fYou WON: ((%s)), LOSER: %s ", a, b);
+  else  if( win == 3 ) { printf("\033[23;1fThe Game ended in a draw!"); }
+	fflush(stdout);
+}
+
+//####################### Create Shared Memory/Sem ########################
+void createShm(int key, struct sembuf sop)
+{
+	memid = shmget(key, NULL,NULL); 
+	
+	if(memid >= 0) //if shm already created
+	{
+		semid = semget(key, NULL, NULL);
+		semop(semid,&sop,1); //semop to allow other player to start playing
+
+		player = 2;
+		usleep(10000); //allow time for other player to start
+	}
+	else //I need to create this game
+	{
+		memid = shmget(key, 32, IPC_CREAT | 0666);
+		semid = semget(key, 1, 0666|IPC_CREAT);
+		player = 1;
+	}
+	
+	if(memid > 0 && semid > 0) shmflg = 1;
+}
+
+//####################### Connect4 Game ########################
+void connect4(char* argv)
+{
+  struct passwd *ppd;
+	char* pointer, myname[10];
+	struct shmid_ds buf;
+	struct sembuf sop, som;
+	int x=50, key, i, j; //num of loops, player num
+	mins=10; secs=0;
+	win = 0;
+
+		
+	//system("clear");
+	//title(); fflush(stdout);
+
+	ppd = getpwuid(getuid());
+	strcpy(myname, ppd->pw_name);
+
+	ppd = getpwnam(argv);
+	if(!ppd) { printf("\033[15;25fUser not found!\n"); getchar();}
+	else
+	{
+		clearToMenu();
+	printf("\033[24;3f\033[1;37;40m\033[2KRIGHT/LEFT: move; ENTER: submit; Q: back to menu\033[m");
+		isTimer=1;
+		gameTimer(); 
+		isTimer=0;
+		sop.sem_num = 0; sop.sem_op = 1; sop.sem_flg = 0; //+1 operation
+		      
+		som.sem_num = 0; som.sem_op = -1; som.sem_flg = 0; //-1 operation
+
+		key = getuid() + ppd->pw_uid;
+		  
+		createShm(key, sop);
+
+		pointer = shmat(memid, 0,0); //get pointer to shm
+	
+		for (i = 0; i < ROWS; i++){ //initialize board
+			for (j = 0; j < COLUMNS; j++){
+				board[i][j] = 0;
+			}
+		}
+
+		printf("\033[2;1f\033[0;30;47m%s vs %s\033[m", myname, ppd->pw_name);
+		display(); //display board on screen
+		fflush(stdout);
+
+		while(x--)
+		{
+			system ("/bin/stty cooked");
+			printf("\033[23;1f\033[0;30;47m\033[2KWaiting For Other Player!");
+			fflush(stdout);
+		
+			while(semop(semid,&som,1)) if(errno != EINTR) break; //wait until other player finishes
+			system ("/bin/stty raw");
+			printf("\033[m\033[2K");
+			alarm(1);
+			if(player==2 || player==1 && x<49){ // when to read move from other player
+				move = atoi(pointer);
+				if(move==-1) break;
+				SWITCH;
+				play();
+				SWITCH;
+			}
+		
+			if(win){ 
+				printf("\033[22;1fPlayer %d Won", win); 
+				break;
+			}
+			else{
+				win = draw();
+				if( win ) { printf("\033[22;1fThe Game ended in a draw!"); break; }
+			}
+			isTimer=2; signal(SIGALRM, gameTimer); 
+			readMove(); if(move==-1) { sprintf(pointer, "%d", -1); fflush(stdout); break;}
+			while(!play()) { readMove(); if(move==-1) break; }
+			isTimer=0;
+			sprintf(pointer, "%d", move); //print my move to shm
+			fflush(stdout);
+			if(move==-1) break;
+			semop(semid,&sop,1); //Allow other player to start his turn
+
+			if(win){
+				printf("\033[22;1fPlayer %d Won", win);
+				break;
+			}
+			else{	
+				win = draw();
+				if( win ) { printf("\033[22;1fThe Game ended in a draw!\n"); break; }
+			}
+			usleep(10000); //time to allow other player to start his turn
+		}
+		signal(SIGALRM, SIG_IGN);
+		fflush(stdout);
+		if(move!=-1){
+		 printWinner(myname, ppd->pw_name);
+		 getchar(); 
+		}		
+		isTimer=-1; gameTimer();
+		printf("\033[2;1f\033[0;30;47m\033[2K");
+		if(player==1){
+			semctl(semid, NULL, IPC_RMID, NULL);
+			shmctl(memid, IPC_RMID, NULL);
+			shmflg=0;
+		}
+	}
+}
+
+//####################### Start Game Menu ########################
+void startGame()
+{
+	int i, ch, flag=1, current=0;
+	char games[2][20] = { "<<  Connect4  >>", "<<  TicTacToe >>"};
+	char args[10];
+
+	clearToMenu();
+	printf("\033[24;32f\033[1;37;40m; Q: back to menu\033[m");
+	//title(); fflush(stdout);
+	printf("\033[5;5fEnter opponent name:\n");fflush(stdout);
+	printf("\033[6;5fChoose Game:\n");  fflush(stdout);
+	for(i=0;i<2;i++) 
+		printf("\033[%d;8f%s", 7+i, games[i]);fflush(stdout);
+	SHOWCURSOR; 
+	printf("\033[5;26f");
+	system("stty echo; stty cooked;");
+	gets(args);
+	HIDECURSOR;
+	system("stty -echo; stty raw;");	
+	do{
+		for(i=0;i<2;i++)
+   	{
+		 	if (i==current) printf("\033[0;37;40m");
+	    else printf("\033[m");
+			fflush(stdout);
+	    printf("\033[%d;8f%s", 7+i, games[i]);fflush(stdout);
+   	}
+		printf("\033[m");
+		ch=getchar();
+		switch(ch)
+		{
+			case 27: //ESC char
+				if((ch=getchar())==91) //After ESC [
+				{	
+					switch((ch=getchar()))
+					{
+						case 65: if(current>0){ current--; printf("\033[1A"); } //UP
+						break;
+						case 66: if(current<1){ current++; printf("\033[1B"); } //DOWN
+						break;
+					}
+				}
+			break;
+			case 13: //Enter=Submit on this position
+				if(current == 0) connect4(args);
+				else if (current == 1) XO(args);
+			case 'Q':
+				flag=0;
+			break;
+		}
+	}while(flag);
+}
+
+//####################### Clear to Show Menu ########################
+void clearToMenu()
+{
+	system("typeset -i r=`tput lines`; typeset -i x=3; while [ $x -lt $r ]; do echo '\033['$x';1f\033[2K'; x=x+1; done;"); 
+}
+
+//####################### Show Main Menu ########################
+void showMenu()
+{
+	char mainMenu[3][25]={ "<< Play a new Game >>",
+											   "<<   Show Scores   >>",
+											   "<<      Exit       >>" };
+	int i, current=0, flag=1, ch;
+
+	title();fflush(stdout);
+	MENUHELP;
+	
+	do{
+		for(i=0;i<3;i++)
+   	{
+		 	if (i==current) printf("\033[1;37;40m");
+	    else printf("\033[m");
+			fflush(stdout);
+	    printf("\033[%d;5f%s", 5+i*2, mainMenu[i]);fflush(stdout);
+   	}
+		printf("\033[m");
+		ch=getchar();
+		switch(ch)
+		{
+			case 27: //ESC char
+				if((ch=getchar())==91) //After ESC [
+				{	
+					switch((ch=getchar()))
+					{
+						case 65: if(current>0){ current--; printf("\033[2A"); } //UP
+						break;
+						case 66: if(current<2){ current++; printf("\033[2B"); } //DOWN
+						break;
+					}
+				}
+			break;
+			case 13: //Enter=Submit on this position
+				if(current == 0){ 
+					startGame(); clearToMenu(); MENUHELP; fflush(stdout); }
+				else if (current == 1){ 
+					printf("\033[20;15fHI"); getchar(); clearToMenu(); MENUHELP; fflush(stdout); current=0; }
+				else if (current == 2) flag=0;
+			break;
+		}
+	}while(flag);
+}
+
+//####################### Initialize And Start ########################
+void start()
+{
+	system("tput smcup"); //alternate screen buffer
+	fflush(stdout);
+	system ("/bin/stty -echo"); //disable auto echo of pressed keys
+	HIDECURSOR; fflush(stdout);
+	
+	system("banner Frankfurt Server");
+	fflush(stdout); //flush stdout to screen
+  sleep(2);
+  system("clear");
+	
+	system ("/bin/stty raw");  //get 1 char from buffer without Enter
+
+	pid = fork();
+	if(pid == 0){
+		usleep(20000);
+		prtime();
+		while(1) pause();
+	}
+	signal(SIGINT, interrupted);
+	
+	showMenu();
+	remove(failez);
+	kill(pid, SIGKILL);
+	SHOWCURSOR; fflush(stdout);
+	system ("/bin/stty cooked");
+	system("/bin/stty echo"); //reset echo
+	system("tput rmcup"); //reset screen buffer
+}
